@@ -1,9 +1,13 @@
 from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+
 import requests
 import os
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+cors = CORS(app)
+app.config['CORS_HEADERS'] = 'application/json'
 
 UPLOAD_FOLDER = 'downloads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -73,6 +77,14 @@ def download_and_save_file():
         return add_cors_headers(jsonify({"error": f"Error downloading file: {str(e)}"})), 500
     except IOError as e:
         return add_cors_headers(jsonify({"error": f"Error saving file: {str(e)}"})), 500
+
+
+@app.route('/test', methods=['GET', 'OPTIONS'])
+def test():
+    return jsonify({
+        "message": f"wawaw",
+        "saved_path": 'awaw',
+    })
 
 
 if __name__ == '__main__':
