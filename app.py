@@ -8,11 +8,13 @@ import uuid
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from dotenv import load_dotenv
+import logging
 
-
+logging.basicConfig(level=logging.DEBUG)
 
 app = Flask(__name__)
-cors = CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
+cors = CORS(app, supports_credentials=True,
+            resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}})
 app.config['CORS_HEADERS'] = 'application/json'
 app.secret_key = os.urandom(24)  # Set a secret key for sessions
 
@@ -40,6 +42,7 @@ msal_app = msal.ConfidentialClientApplication(
     CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_KEY
 )
 
+
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
@@ -54,7 +57,7 @@ def auth_status():
     if 'user' not in session:
         print("No user in session")
         return jsonify({"isAuthenticated": False, "reason": "No user in session"})
-    
+
     if 'token' not in session:
         print("No token in session")
         return jsonify({"isAuthenticated": False, "reason": "No token in session"})
@@ -84,35 +87,38 @@ def auth_status():
     })
 
 
-
 @app.route('/login')
 def login():
-    session["state"] = str(uuid.uuid4())
+    state = str(uuid.uuid4())
+    session['state'] = state  # Store state in server-side session
     frontend_redirect_uri = request.args.get('redirect_uri', 'http://localhost:3000/dashboard')
     session['frontend_redirect_uri'] = frontend_redirect_uri
 
     auth_url = msal_app.get_authorization_request_url(
         SCOPE,
-        state=session["state"],
+        state=state,
         redirect_uri=url_for("authorized", _external=True)
     )
-    
+
     return jsonify({"auth_url": auth_url})
+
 
 @app.route('/auth/callback')
 def auth_callback():
     if session.get("user"):
-        return redirect("http://localhost:3000/dashboard") 
+        return redirect("http://localhost:3000/dashboard")
     else:
-        return redirect("http://localhost:3000") 
+        return redirect("http://localhost:3000")
+
 
 @app.route(REDIRECT_PATH)
 def authorized():
+    # logging.debug(f"Received authorization request: {request.args}")
     if request.args.get('state') != session.get("state"):
         return "State mismatch", 400
     if "error" in request.args:
         return request.args.get("error"), 400
-    
+
     token_result = msal_app.acquire_token_by_authorization_code(
         request.args['code'],
         scopes=SCOPE,
@@ -128,7 +134,7 @@ def authorized():
         session["token_expiry"] = (datetime.now() + timedelta(seconds=token_result['expires_in'])).isoformat()
 
     frontend_redirect_uri = session.pop('frontend_redirect_uri', 'http://localhost:3000/dashboard')
-    
+
     user_info = urlencode({
         "user_name": session["user"].get("name", ""),
         "user_email": session["user"].get("preferred_username", "")
@@ -137,62 +143,45 @@ def authorized():
 
     return redirect(redirect_url)
 
+
 @app.route('/')
 def index():
     if not session.get("user"):
         return redirect(url_for("login"))
     return jsonify({"message": "Logged in", "user": session["user"]})
 
+
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for("index"))
+
 
 @app.route('/download-and-save', methods=['POST', 'OPTIONS'])
 def download_and_save_file():
     if request.method == 'OPTIONS':
         return add_cors_headers(make_response())
 
-    if not session.get("token"):
-        return add_cors_headers(jsonify({"error": "Not authenticated"})), 401
-
-    if datetime.now() >= session.get("token_expiry", datetime.min):
-        token_result = msal_app.acquire_token_silent(SCOPE, account=session["user"])
-        if not token_result:
-            return add_cors_headers(jsonify({"error": "Token expired, please log in again"})), 401
-        session["token"] = token_result
-        session["token_expiry"] = datetime.now() + timedelta(seconds=token_result['expires_in'])
-
     file_data = request.json
+    logging.debug(f"Received file data: {file_data}")
 
     if not file_data or 'value' not in file_data or not file_data['value']:
         return add_cors_headers(jsonify({"error": "Invalid file data"})), 400
 
-    access_token = session["token"]["access_token"]
-    api_endpoint = "https://graph.microsoft.com/v1.0/"
-    file_id = file_data['value'][0]['id']
+    file_info = file_data['value'][0]
+    download_url = file_info.get('@microsoft.graph.downloadUrl')
+    file_name = file_info.get('name', 'unknown_file')
 
-    if not all([access_token, api_endpoint, file_id]):
-        return add_cors_headers(jsonify({"error": "Missing required file information"})), 400
+    if not download_url:
+        return add_cors_headers(jsonify({"error": "Download URL not found in file data"})), 400
 
     try:
-        metadata_url = f"{api_endpoint}drives/me/items/{file_id}"
-        metadata_response = requests.get(metadata_url, headers={
-            'Authorization': f'Bearer {access_token}'
-        })
-        metadata_response.raise_for_status()
-        metadata = metadata_response.json()
+        logging.debug(f"Attempting to download file from: {download_url}")
 
-        file_name = metadata.get('name', 'unknown_file')
-
-        content_url = f"{api_endpoint}drives/me/items/{file_id}/content"
-        download_response = requests.get(content_url, headers={
-            'Authorization': f'Bearer {access_token}'
-        })
+        download_response = requests.get(download_url)
         download_response.raise_for_status()
 
         secure_name = secure_filename(file_name)
-
         save_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_name)
 
         os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -200,15 +189,23 @@ def download_and_save_file():
         with open(save_path, 'wb') as f:
             f.write(download_response.content)
 
+        logging.debug(f"File saved successfully at: {save_path}")
+
         return add_cors_headers(jsonify({
             "message": f"File {secure_name} downloaded successfully and saved",
             "saved_path": save_path,
         })), 200
 
     except requests.RequestException as e:
+        logging.error(f"RequestException: {str(e)}")
         return add_cors_headers(jsonify({"error": f"Error downloading file: {str(e)}"})), 500
     except IOError as e:
+        logging.error(f"IOError: {str(e)}")
         return add_cors_headers(jsonify({"error": f"Error saving file: {str(e)}"})), 500
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        return add_cors_headers(jsonify({"error": f"Unexpected error: {str(e)}"})), 500
+
 
 @app.route('/test', methods=['GET', 'OPTIONS'])
 def test():
@@ -222,5 +219,7 @@ def test():
 def debug_session():
     return jsonify(dict(session))
 
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000, host='0.0.0.0')
+    # app.run(debug=True)
