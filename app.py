@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 import logging
+import re
+
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -77,13 +79,23 @@ def auth_status():
         print(f"Error parsing expiry time: {e}")
         return jsonify({"isAuthenticated": False, "reason": f"Error parsing expiry time: {e}"})
 
+     # Determine the endpoint hint based on the user's account type
+    user_email = session['user'].get('preferred_username', '')
+    
+    endpoint_hint = "api.onedrive.com"
+    if 'live.com' in user_email.lower():
+        endpoint_hint = 'api.onedrive.com'
+    elif 'sharepoint_url' in session:
+        endpoint_hint = f"{session['sharepoint_url']}"
+
     return jsonify({
         "isAuthenticated": True,
         "user": {
             "name": session['user'].get('name'),
             "email": session['user'].get('preferred_username')
         },
-        "token": session["token"]
+        "token": session["token"],
+        "endpointHint": endpoint_hint
     })
 
 
@@ -97,7 +109,8 @@ def login():
     auth_url = msal_app.get_authorization_request_url(
         SCOPE,
         state=state,
-        redirect_uri=url_for("authorized", _external=True)
+        redirect_uri=url_for("authorized", _external=True),
+        prompt='select_account'
     )
 
     return jsonify({"auth_url": auth_url})
@@ -113,33 +126,45 @@ def auth_callback():
 
 @app.route(REDIRECT_PATH)
 def authorized():
-    # logging.debug(f"Received authorization request: {request.args}")
     if request.args.get('state') != session.get("state"):
-        return "State mismatch", 400
+        return jsonify({"error": "State mismatch"}), 400
     if "error" in request.args:
-        return request.args.get("error"), 400
+        return jsonify({"error": request.args.get("error")}), 400
 
-    token_result = msal_app.acquire_token_by_authorization_code(
+    cache = msal.SerializableTokenCache()
+    if session.get("token_cache"):
+        cache.deserialize(session["token_cache"])
+    
+    result = msal_app.acquire_token_by_authorization_code(
         request.args['code'],
         scopes=SCOPE,
         redirect_uri=url_for("authorized", _external=True)
     )
 
-    if "error" in token_result:
-        return token_result.get("error"), 400
+    if "error" in result:
+        return jsonify({"error": result.get("error")}), 400
 
-    if "error" not in token_result:
-        session["user"] = token_result.get("id_token_claims")
-        session["token"] = token_result['access_token']  # Store just the access token
-        session["token_expiry"] = (datetime.now() + timedelta(seconds=token_result['expires_in'])).isoformat()
+    session["user"] = result.get("id_token_claims")
+    session["token"] = result.get('access_token')
+    session["token_expiry"] = (datetime.now() + timedelta(seconds=result['expires_in'])).isoformat()
+
+    # Store the SharePoint URL
+    graph_client = GraphClient(session["token"])
+    sharepoint_url = graph_client.get_sharepoint_url()
+    session["sharepoint_url"] = sharepoint_url
+
+    cache.add(result)
+    session["token_cache"] = cache.serialize()
 
     frontend_redirect_uri = session.pop('frontend_redirect_uri', 'http://localhost:3000/dashboard')
-
     user_info = urlencode({
         "user_name": session["user"].get("name", ""),
         "user_email": session["user"].get("preferred_username", "")
     })
+
+
     redirect_url = f"{frontend_redirect_uri}?{user_info}"
+
 
     return redirect(redirect_url)
 
@@ -153,8 +178,25 @@ def index():
 
 @app.route('/logout')
 def logout():
-    session.clear()
-    return redirect(url_for("index"))
+    try:
+        if 'token' in session:
+            token = session['token']
+            
+            # Attempt to revoke the token
+            revoke_url = f"{AUTHORITY}/oauth2/v2.0/logout"
+            response = requests.post(revoke_url, data={'token': token})
+            
+            if response.status_code != 200:
+                logging.warning(f"Token revocation failed with status code: {response.status_code}")
+
+        # Clear the session
+        session.clear()
+        
+        return jsonify({"message": "Logged out successfully"}), 200
+    
+    except Exception as e:
+        logging.error(f"Error during logout: {str(e)}")
+        return jsonify({"error": "An error occurred during logout"}), 500
 
 
 @app.route('/download-and-save', methods=['POST', 'OPTIONS'])
@@ -220,6 +262,29 @@ def debug_session():
     return jsonify(dict(session))
 
 
+class GraphClient:
+    def __init__(self, access_token):
+        self.access_token = access_token
+
+    def get_sharepoint_url(self):
+        # Use Microsoft Graph API to get the user's SharePoint URL
+        # This is a placeholder implementation. You'll need to replace this with actual Graph API calls.
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Accept': 'application/json'
+        }
+        response = requests.get('https://graph.microsoft.com/v1.0/me/drive/root', headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            web_url = data.get('webUrl', '')
+            # Extract the SharePoint URL from the webUrl
+            return web_url.split('/personal/')[0] if '/personal/' in web_url else None
+        return None
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000, host='0.0.0.0')
     # app.run(debug=True)
+
+
+
